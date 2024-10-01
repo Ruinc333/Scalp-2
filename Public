@@ -1,0 +1,124 @@
+import pandas as pd
+import ta
+import backtrader as bt
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score
+
+# Load and preprocess data
+data = pd.read_csv('your_data.csv', index_col='Date', parse_dates=True)
+data['SMA5'] = data['Close'].rolling(window=5).mean()
+data['SMA8'] = data['Close'].rolling(window=8).mean()
+data['RSI'] = ta.momentum.RSIIndicator(data['Close'], window=14).rsi()
+
+# Define features and target
+data['Target'] = (data['Close'].shift(-1) > data['Close']).astype(int)  # Example target: 1 if next day's close is higher, else 0
+features = ['SMA5', 'SMA8', 'RSI']
+target = 'Target'
+
+# Split data into training and testing sets
+X_train, X_test, y_train, y_test = train_test_split(data[features].dropna(), data[target].dropna(), test_size=0.2, random_state=42)
+
+# Train the model
+model = DecisionTreeClassifier()
+model.fit(X_train, y_train)
+
+# Predict and evaluate
+y_pred = model.predict(X_test)
+accuracy = accuracy_score(y_test, y_pred)
+print(f'Accuracy: {accuracy:.2f}')
+
+class MLScalpingStrategy(bt.Strategy):
+    params = (
+        ('sma5_period', 5),
+        ('sma8_period', 8),
+        ('sma13_period', 13),
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('rsi_period', 14),
+        ('stop_loss', 0.02),  # 2% stop loss
+        ('take_profit', 0.03),  # 3% take profit
+    )
+
+    def __init__(self):
+        self.sma5 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.sma5_period)
+        self.sma8 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.sma8_period)
+        self.sma13 = bt.indicators.SimpleMovingAverage(self.data.close, period=self.params.sma13_period)
+        self.bb = bt.indicators.BollingerBands(self.data.close, period=self.params.bb_period, devfactor=self.params.bb_dev)
+        self.rsi = bt.indicators.RelativeStrengthIndex(self.data.close, period=self.params.rsi_period)
+
+    def next(self):
+        # Prepare the feature set for the current bar
+        features = [self.sma5[0], self.sma8[0], self.rsi[0]]
+        prediction = model.predict([features])[0]
+
+        if prediction == 1 and self.data.close[0] < self.bb.lines.bot:
+            self.buy()
+            self.sell(exectype=bt.Order.Stop, price=self.data.close[0] * (1 - self.params.stop_loss))
+            self.sell(exectype=bt.Order.Limit, price=self.data.close[0] * (1 + self.params.take_profit))
+        elif prediction == 0 and self.data.close[0] > self.bb.lines.top:
+            self.sell()
+            self.buy(exectype=bt.Order.Stop, price=self.data.close[0] * (1 + self.params.stop_loss))
+            self.buy(exectype=bt.Order.Limit, price=self.data.close[0] * (1 - self.params.take_profit))
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            if order.isbuy():
+                self.log(f'BUY EXECUTED, {order.executed.price}')
+            elif order.issell():
+                self.log(f'SELL EXECUTED, {order.executed.price}')
+
+    def notify_trade(self, trade):
+        if not trade.isclosed:
+            return
+        self.log(f'OPERATION PROFIT, GROSS {trade.pnl}, NET {trade.pnlcomm}')
+
+    def log(self, txt, dt=None):
+        dt = dt or self.datas[0].datetime.date(0)
+        print(f'{dt.isoformat()}, {txt}')
+
+# Load your data
+datafeed = bt.feeds.PandasData(dataname=data)
+
+# Initialize Cerebro engine
+cerebro = bt.Cerebro()
+cerebro.addstrategy(MLScalpingStrategy)
+cerebro.adddata(datafeed)
+cerebro.broker.set_cash(100000)
+cerebro.addsizer(bt.sizers.PercentSizer, percents=1)
+
+# Add DrawDown analyzer
+cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+
+# Run the backtest
+results = cerebro.run()
+drawdown = results[0].analyzers.drawdown.get_analysis()
+
+# Print the maximum drawdown
+print(f'Maximum Drawdown: {drawdown.max.drawdown:.2f}%')
+
+# Plot the results
+cerebro.plot()
+class ScalpingStrategyWithSlippage(bt.Strategy):
+    params = (
+        ('sma5_period', 5),
+        ('sma8_period', 8),
+        ('sma13_period', 13),
+        ('bb_period', 20),
+        ('bb_dev', 2),
+        ('rsi_period', 14),
+        ('stop_loss', 0.02),  # 2% stop loss
+        ('take_profit', 0.03),  # 3% take profit
+        ('slippage', 0.001),  # 0.1% slippage
+    )
+
+    def next(self):
+        slippage = self.params.slippage
+        if self.sma5 > self.sma8 > self.sma13 and self.data.close[0] < self.bb.lines.bot and self.rsi < 30:
+            self.buy(price=self.data.close[0] * (1 + slippage))
+            self.sell(exectype=bt.Order.Stop, price=self.data.close[0] * (1 - self.params.stop_loss))
+            self.sell(exectype=bt.Order.Limit, price=self.data.close[0] * (1 + self.params.take_profit))
+        elif self.sma5 < self.sma8 < self.sma13 and self.data.close[0] > self.bb.lines.top and self.rsi > 70:
+            self.sell(price=self.data.close[0] * (1 - slippage))
+            self.buy(exectype=bt.Order.Stop, price=self.data.close[0] * (1 + self.params.stop_loss))
+            self.buy(exectype=bt.Order.Limit, price=self.data.close[0] * (1 - self.params.take_profit))
